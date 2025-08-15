@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  articles_generator_service:
+    container_name: articles_generator_service
+    network_mode: host
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Europe/Moscow
+      - HOST_WORKDIR=/app/data
+    volumes:
+      - ./data:/app/data
+    command: ["/bin/sh", "-c", "exec uvicorn app:app --host 0.0.0.0 --port 8001"]
