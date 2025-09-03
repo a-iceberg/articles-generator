@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import logging, sys
-log = logging.getLogger("uvicorn.error")  
 import csv
 import html
 import json
+import logging
 import os
 import re
 import textwrap
@@ -12,16 +11,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Optional
 
-from anthropic import Anthropic
+import tiktoken
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
+from openai import OpenAI
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from pydantic import BaseModel
+import uvicorn
+from tqdm.auto import tqdm
 from fastapi.responses import StreamingResponse, FileResponse
 from threading import Thread
 from queue import Queue
 import uuid
-
 # ─────────────────────────────── НАСТРОЙКИ ПУТЕЙ ───────────────────────────────
 # ВСЕ файлы читаем/пишем в хостовую папку (монтируемую как /work).
 BASE_DIR = Path(os.getenv("HOST_WORKDIR", "/work"))
@@ -33,9 +34,11 @@ SYSTEM_PROMPT_TZ = (
     "Пишешь для мастеров и обычных людей, уважительно, по делу, с опорой на официальные данные. "
     "Тон дружелюбный, но профессиональный, допускается лёгкий жаргон и бытовые примеры. "
 
+    # Жёсткие правила заголовков
     "ВНИМАНИЕ: запрещены двоеточия, тире, скобки, союзы «и/или» в заголовках любого уровня. "
     "Один заголовок — одна мысль или один вопрос. Заголовки длиной 2–5 слов, без кликбейта. "
 
+    # Анти-усреднение и анти-ИИ-шаблоны
     "Избегай обтекаемых формулировок («высока вероятность», «в некоторых случаях», «может быть»). "
     "Не вставляй пустые универсальные фразы («главный принцип — безопасность») без конкретных действий и данных. "
     "Разделы не обязаны быть одинаковыми по объёму — глубоко раскрывай важное, второстепенное описывай кратко. "
@@ -128,10 +131,22 @@ TZ_USER_PROMPT_TEMPLATE = textwrap.dedent(
     """
 ).strip()
 
-SYSTEM_PROMPT_ARTICLE = (
+ARTICLE_USER_PROMPT_TEMPLATE = textwrap.dedent(
+    """
+    <articleId>{article_id}</articleId>
+
+    Напиши ПОЛНУЮ статью (≈15 000 зн.) по этому техническому заданию:
+    ——————————————————————————————————————————
+    {tz_text}
+    ——————————————————————————————————————————
+    """
+).strip()
+
+INSTRUCTIONS_ARTICLE = textwrap.dedent("""
     "Ты — технический копирайтер. Пиши статью строго по техническому заданию, только готовый HTML-текст. "
     "❗ НЕ оформляй ответ в виде markdown-блока ```html```. "
     "Без картинок и внешних ссылок. Используй только теги <h1>–<h6>, <p>, <ul>/<ol>, <table>. "
+    "Стиль, структура, лексика — как в примерах из vector store. "
     "Не используй двоеточия и составные заголовки (только одна мысль на заголовок). "
     "Не используй формулы вроде «причины и что делать», «почему и как решить», «FAQ по теме» и т.п. "
     "В каждом заголовке — только отдельный смысл, вопрос или утверждение. "
@@ -143,42 +158,48 @@ SYSTEM_PROMPT_ARTICLE = (
     "Не вставляй универсальные пустые фразы («главный принцип — безопасность») без конкретики и действий. "
     "Избегай усреднения — глубина и объём разделов могут сильно различаться, не делай симметричных списков и блоков. "
     "Не вставляй текст ТЗ, не используй markdown, никаких служебных пометок — только содержимое статьи."
-)
+""").strip()
 
-ARTICLE_USER_PROMPT_TEMPLATE = textwrap.dedent(
-    """
-    <articleId>{article_id}</articleId>
+# Стоимость 
+INPUT_COST_PER_M = 2.00
+OUTPUT_COST_PER_M = 8.00
 
-    Напиши ПОЛНУЮ статью (≈15 000 зн.) по этому техническому заданию:
-    ——————————————————————————————————————————
-    {tz_text}
-    ——————————————————————————————————————————
-    """
-).strip()
-
-# Модель и параметры Claude
-MODEL_NAME = "claude-sonnet-4-20250514"
+# Модель, лимиты, температура
+MODEL_NAME = "gpt-4.1"
 MAX_TOKENS_TZ = 3500
-MAX_TOKENS_ARTICLE = 10000
-TEMPERATURE = 1.0
+MAX_TOKENS_ARTICLE = 6000
+TEMPERATURE = 1
 
 # ─────────────────────────────── УТИЛИТЫ ───────────
-def load_anthropic_key() -> str:
-    if (key := os.environ.get("ANTHROPIC_API_KEY")):
+def count_tokens(text: str, model=MODEL_NAME):
+    try:
+        encoder = tiktoken.encoding_for_model(model)
+    except KeyError:
+        encoder = tiktoken.get_encoding("cl100k_base")
+    return len(encoder.encode(text))
+
+def calculate_cost(tokens, input=True):
+    tokens_in_millions = tokens / 1_000_000
+    return tokens_in_millions * (INPUT_COST_PER_M if input else OUTPUT_COST_PER_M)
+
+def load_openai_key() -> str:
+    if (key := os.environ.get("OPENAI_API_KEY")):
         return key
     auth_file = BASE_DIR / "auth.json"
     if auth_file.exists():
         with auth_file.open(encoding="utf-8") as f:
-            data = json.load(f)
-            if "ANTHROPIC_API_KEY" in data:
-                return data["ANTHROPIC_API_KEY"]
-    raise RuntimeError("ANTHROPIC_API_KEY не найден ни в окружении, ни в auth.json")
+            return json.load(f)["OPENAI_API_KEY"]
+    raise RuntimeError("OpenAI key not found in env or auth.json")
 
-def anthropic_cost_usd(input_tokens: int, output_tokens: int) -> float:
-    # Sonnet 4: $3 / $15 за 1M токенов (in/out)
-    cin = 3.0 / 1_000_000
-    cout = 15.0 / 1_000_000
-    return input_tokens * cin + output_tokens * cout
+def load_vector_store_id() -> str:
+    state_file = BASE_DIR / "state.json"
+    if not state_file.exists():
+        raise RuntimeError("Файл state.json не найден в рабочей папке. В нём должен быть vector_store_id.")
+    with state_file.open(encoding="utf-8") as f:
+        state = json.load(f)
+    if "vector_store_id" not in state:
+        raise RuntimeError("В state.json отсутствует ключ vector_store_id.")
+    return state["vector_store_id"]
 
 def slugify(text_: str) -> str:
     text_ = re.sub(r"<[^>]+>", "", text_)
@@ -200,37 +221,30 @@ def extract_keywords(block: str) -> List[Tuple[str, int]]:
             pairs.append((key, int(freq)))
     return pairs
 
-# ─────────────────────────────── КЛИЕНТ CLAUDE ─────────────────────────
-def get_anthropic_client() -> Anthropic:
-    return Anthropic(api_key=load_anthropic_key())
-
 @retry(wait=wait_exponential_jitter(initial=1, max=20), stop=stop_after_attempt(3))
-def claude_complete(client: Anthropic, system_prompt: str, user_text: str,
-                    max_tokens: int, temperature: float) -> tuple[str, int, int]:
-    msg = client.messages.create(
+def chat_complete(client: OpenAI, messages: list[dict], max_tokens: int) -> tuple[str, int, int]:
+    response = client.chat.completions.create(
         model=MODEL_NAME,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_text}],
+        messages=messages,
         max_tokens=max_tokens,
-        temperature=temperature,
+        temperature=TEMPERATURE,
     )
-    
-    parts: list[str] = []
-    for b in msg.content:
-        if getattr(b, "type", None) == "text":
-            parts.append(getattr(b, "text", ""))
-    text = "".join(parts).strip()
-    usage = getattr(msg, "usage", None)
-    in_toks = getattr(usage, "input_tokens", 0) if usage else 0
-    out_toks = getattr(usage, "output_tokens", 0) if usage else 0
-    return text, in_toks, out_toks
+    content = response.choices[0].message.content.strip()
+    usage = response.usage
+    prompt_tokens = usage.prompt_tokens if usage else count_tokens(str(messages))
+    completion_tokens = usage.completion_tokens if usage else count_tokens(content)
+    return content, prompt_tokens, completion_tokens
 
 # ─────────────────────────────── ОСНОВНАЯ ФУНКЦИЯ ───────────────────────
 def generate_articles(input_csv: Path, groups_start: int, groups_end: Optional[int], save_html: bool = False):
     # Логи
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
+    logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
 
-    client = get_anthropic_client()
+    # Инициализация клиента и векторного хранилища
+    client = OpenAI(api_key=load_openai_key())
+    vector_store_id = load_vector_store_id()
 
     # Пути на хосте
     input_csv = input_csv if input_csv.is_absolute() else (BASE_DIR / input_csv)
@@ -240,50 +254,68 @@ def generate_articles(input_csv: Path, groups_start: int, groups_end: Optional[i
     out_csv = BASE_DIR / "articles.csv"
 
     groups = parse_groups(input_csv)
-    log.info("Загружено групп: %d", len(groups))
-    groups_slice = groups[groups_start:] if groups_end is None else groups[groups_start:groups_end]
-    log.info("Будет обработано групп: %d (с %d по %d)", len(groups_slice), groups_start + 1, (groups_end or len(groups)))
-    log.info("🚀 Старт обработки...")
+    if groups_end is None:
+        groups_slice = groups[groups_start:]
+    else:
+        groups_slice = groups[groups_start:groups_end]
 
+    # CSV
     with out_csv.open("w", newline="", encoding="utf-8") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=["title", "slug", "tz", "html"])
         writer.writeheader()
 
         total_cost = 0.0
-        saved_html_files: list[str] = []
+        saved_html_files = []
 
-        for i, block in enumerate(groups_slice, 1):
-            log.info("Обрабатывается группа %d из %d", i, len(groups_slice))
+        pbar = tqdm(groups_slice, desc="Обработка групп", unit="grp", dynamic_ncols=True, disable=True)
+        pbar.set_postfix_str(f"сумма ${total_cost:.4f}")
+
+        for i, block in enumerate(pbar, 1):
+            tqdm.write(f"Обрабатывается группа {i} из {len(groups_slice)}")
 
             keywords = extract_keywords(block)
             if not keywords:
-                log.warning("Группа %d не содержит ключей — пропущена", i)
+                tqdm.write(f"⚠️ Группа {i} не содержит ключей — пропущена")
+                pbar.update(0)
                 continue
 
             main_query = keywords[0][0]
             phrases_block = "\n".join(f"{k} частотность {f}" for k, f in keywords)
 
-            # 1) ТЗ => Claude
+            # ТЗ
             tz_prompt = TZ_USER_PROMPT_TEMPLATE.format(
                 main_query=main_query, phrases_block=phrases_block
             )
-            tz_text, tz_in_tokens, tz_out_tokens = claude_complete(
-                client, SYSTEM_PROMPT_TZ, tz_prompt,
-                max_tokens=MAX_TOKENS_TZ, temperature=TEMPERATURE
+            tz_messages = [
+                {"role": "system", "content": SYSTEM_PROMPT_TZ},
+                {"role": "user", "content": tz_prompt},
+            ]
+            tz_text, tz_in_tokens, tz_out_tokens = chat_complete(
+                client, tz_messages, max_tokens=MAX_TOKENS_TZ
             )
 
-            # 2) Статья => Claude
+            # Статья
             article_id = f"ID{i:05d}"
             art_prompt = ARTICLE_USER_PROMPT_TEMPLATE.format(
                 article_id=article_id, tz_text=tz_text
             )
-            html_text, art_in_tokens, art_out_tokens = claude_complete(
-                client, SYSTEM_PROMPT_ARTICLE, art_prompt,
-                max_tokens=MAX_TOKENS_ARTICLE, temperature=TEMPERATURE
+
+            response = client.responses.create(
+                model="gpt-4.1",
+                input=art_prompt,
+                tools=[{
+                    "type": "file_search",
+                    "vector_store_ids": [vector_store_id],
+                    "max_num_results": 10
+                }],
+                temperature=TEMPERATURE,
+                max_output_tokens=10000,
+                instructions=INSTRUCTIONS_ARTICLE
             )
+            html_text = response.output_text.strip()
 
             # снять возможные ```html
-            fence = re.compile(r"^```\s*html\s*$|^```$", re.I)
+            fence = re.compile(r"^```\\s*html\\s*|\\s*```$", re.I)
             html_text = "\n".join(
                 line for line in html_text.splitlines() if not fence.match(line)
             ).strip()
@@ -295,7 +327,7 @@ def generate_articles(input_csv: Path, groups_start: int, groups_end: Optional[i
 
             # Запись в общий CSV
             writer.writerow({"title": title, "slug": slug, "tz": tz_text, "html": html_text})
-            log.info("✅ Сохранено в CSV: %s", slug)
+            tqdm.write(f"✅ Сохранено в CSV: {slug}")
 
             # (Опционально) сохранить отдельный html на хосте
             if save_html:
@@ -304,21 +336,28 @@ def generate_articles(input_csv: Path, groups_start: int, groups_end: Optional[i
                 out_file = out_dir / f"{slug}.html"
                 out_file.write_text(html_text, encoding="utf-8")
                 saved_html_files.append(str(out_file))
-                log.info("💾 HTML-файл сохранён на хосте: %s", out_file)
+                tqdm.write(f"💾 HTML-файл сохранён на хосте: {out_file}")
 
-            # Стоимость (Anthropic)
-            tz_cost  = anthropic_cost_usd(tz_in_tokens, tz_out_tokens)
-            art_cost = anthropic_cost_usd(art_in_tokens, art_out_tokens)
+            # Стоимость
+            art_in_tokens = count_tokens(art_prompt)
+            art_out_tokens = count_tokens(html_text)
+
+            tz_cost = calculate_cost(tz_in_tokens, True) + calculate_cost(tz_out_tokens, False)
+            art_cost = calculate_cost(art_in_tokens, True) + calculate_cost(art_out_tokens, False)
             art_total_cost = tz_cost + art_cost
             total_cost += art_total_cost
 
-            log.info(
-                "🔸 Токены ТЗ (in/out): %s/%s | Статья (in/out): %s/%s | Стоимость: $%.4f (сумма: $%.4f)",
-                tz_in_tokens, tz_out_tokens, art_in_tokens, art_out_tokens, art_total_cost, total_cost
+            tqdm.write(
+                f"🔸 Токены ТЗ (in/out): {tz_in_tokens}/{tz_out_tokens} | "
+                f"Статья (in/out): {art_in_tokens}/{art_out_tokens} | "
+                f"Стоимость: ${art_total_cost:.4f} (сумма: ${total_cost:.4f})"
             )
+            pbar.set_postfix_str(f"сумма ${total_cost:.4f}")
 
-    log.info("Готово → файл %s", out_csv)
-    log.info("ИТОГОВАЯ сумма: $%.4f", total_cost)
+        pbar.close()
+
+    tqdm.write(f"Готово → файл {out_csv}")
+    tqdm.write(f"ИТОГОВАЯ сумма: ${total_cost:.4f}")
 
     return {
         "articles_csv": str(out_csv),
@@ -334,7 +373,7 @@ class GenerateRequest(BaseModel):
     groups_end: Optional[int] = None  # null => до конца
     save_html: bool = False
 
-app = FastAPI(title="Articles Generator API (Claude)")
+app = FastAPI(title="Articles Generator API")
 
 @app.post("/articles_generator")
 def articles_generator(req: GenerateRequest):
@@ -348,9 +387,16 @@ def articles_generator(req: GenerateRequest):
         return {"ok": True, **result}
     except FileNotFoundError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
-        log.exception("Ошибка генерации")
-        raise HTTPException(status_code=500, detail="Internal error")
+    except Exception as e:
+        # Лог и проброс
+        logging.exception("Ошибка генерации")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+#if __name__ == "__main__":
+    # Запускаем сервер на 0.0.0.0:8001
+    #uvicorn.run("app:app", host="0.0.0.0", port=8001, reload=False)
+
 
 @app.post("/articles_generator_upload")
 async def articles_generator_upload(
@@ -361,10 +407,8 @@ async def articles_generator_upload(
     save_html: bool = Form(False),
     keep_server_copy: bool = Form(True),
 ):
-    log.info(
-        "UPLOAD start: %s, groups_start=%s, groups_end=%s, save_html=%s, keep=%s",
-        file.filename, groups_start, groups_end, save_html, keep_server_copy
-    )
+    logging.info(f"UPLOAD start: {file.filename}, groups_start={groups_start}, groups_end={groups_end}, save_html={save_html}, keep={keep_server_copy}")
+    # Сохраняем входной CSV именно в BASE_DIR (volume)
     tmp_name = f"{uuid.uuid4()}_{file.filename}"
     tmp_path = BASE_DIR / tmp_name
     with tmp_path.open("wb") as f:
@@ -380,38 +424,46 @@ async def articles_generator_upload(
         csv_path = Path(result["articles_csv"])
 
         headers = {
-            "X-Groups-Processed": str(result.get("groups_processed", "")),
-            "X-Total-Cost": str(result.get("total_cost", "")),
-            "X-Articles-Filename": csv_path.name,
-        }
+        "X-Groups-Processed": str(result.get("groups_processed", "")),
+        "X-Total-Cost": str(result.get("total_cost", "")),
+        "X-Articles-Filename": csv_path.name,  # опционально
+         }
 
+        # Если не хотим хранить итоговый файл на сервере — удаляем после отдачи
         if not keep_server_copy:
             background.add_task(os.remove, csv_path)
+
+        # В любом случае удаляем загруженный CSV после обработки
         background.add_task(os.remove, tmp_path)
 
         return FileResponse(
-            csv_path,
-            media_type="text/csv",
-            filename="articles.csv",
-            headers=headers,
-            background=background,
+        csv_path,
+        media_type="text/csv",
+        filename="articles.csv",
+        headers=headers,
+        background=background,
         )
     except Exception:
+        # На всякий случай подчистим загруженный CSV и при ошибке
         try: os.remove(tmp_path)
         except: pass
         raise
 
+
 @app.post("/articles_generator_stream")
 def articles_generator_stream(req: GenerateRequest):
-    """
-    SSE без прогрессбара: стримим ключевые события строками.
-    """
     q = Queue()
     DONE = object()
+    orig = tqdm.write
+
+    def capture(msg, *a, **kw):
+        text = msg if isinstance(msg, str) else str(msg)
+        q.put(text)                 # отправляем строку прогресса
+        orig(text, *a, **kw)        # и дублируем в серверные логи
 
     def worker():
         try:
-            q.put("Начали обработку")
+            tqdm.write = capture
             result = generate_articles(
                 input_csv=Path(req.input_csv),
                 groups_start=req.groups_start,
@@ -422,6 +474,7 @@ def articles_generator_stream(req: GenerateRequest):
         except Exception as e:
             q.put(json.dumps({"_error": str(e)}, ensure_ascii=False))
         finally:
+            tqdm.write = orig
             q.put(DONE)
 
     Thread(target=worker, daemon=True).start()
