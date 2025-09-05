@@ -21,6 +21,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 from threading import Thread
 from queue import Queue
 import uuid
+from fastapi import Query
 
 # ─────────────────────────────── НАСТРОЙКИ ПУТЕЙ ───────────────────────────────
 # ВСЕ файлы читаем/пишем в хостовую папку (монтируемую как /work).
@@ -226,106 +227,150 @@ def claude_complete(client: Anthropic, system_prompt: str, user_text: str,
     return text, in_toks, out_toks
 
 # ─────────────────────────────── ОСНОВНАЯ ФУНКЦИЯ ───────────────────────
-def generate_articles(input_csv: Path, groups_start: int, groups_end: Optional[int], save_html: bool = False):
-    # Логи
+def generate_articles(input_csv: Path, groups_start: int, groups_end: Optional[int], save_html: bool = False, client_emit=None):
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    client = get_anthropic_client()
+    # --- ТРАНСЛЯЦИЯ ЛОГОВ К КЛИЕНТУ (если передали client_emit) ---
+    # Сохраняем оригинальные методы
+    _orig_info = log.info
+    _orig_warning = log.warning
+    _orig_error = log.error
+    _orig_exception = log.exception
 
-    # Пути на хосте
-    input_csv = input_csv if input_csv.is_absolute() else (BASE_DIR / input_csv)
-    if not input_csv.exists():
-        raise FileNotFoundError(f"Входной CSV не найден: {input_csv}")
+    def _emit(prefix, msg, args):
+        # Формат как в контейнере: "INFO:     Текст..."
+        if client_emit:
+            try:
+                client_emit(f"{prefix}:     {msg % args}")
+            except Exception:
+                pass
 
-    out_csv = BASE_DIR / "articles.csv"
+    def _info(msg, *args, **kwargs):
+        _orig_info(msg, *args, **kwargs)
+        _emit("INFO", msg, args)
 
-    groups = parse_groups(input_csv)
-    log.info("Загружено групп: %d", len(groups))
-    groups_slice = groups[groups_start:] if groups_end is None else groups[groups_start:groups_end]
-    log.info("Будет обработано групп: %d (с %d по %d)", len(groups_slice), groups_start + 1, (groups_end or len(groups)))
-    log.info("🚀 Старт обработки...")
+    def _warning(msg, *args, **kwargs):
+        _orig_warning(msg, *args, **kwargs)
+        _emit("WARNING", msg, args)
 
-    with out_csv.open("w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=["title", "slug", "tz", "html"])
-        writer.writeheader()
+    def _error(msg, *args, **kwargs):
+        _orig_error(msg, *args, **kwargs)
+        _emit("ERROR", msg, args)
 
-        total_cost = 0.0
-        saved_html_files: list[str] = []
+    def _exception(msg, *args, **kwargs):
+        _orig_exception(msg, *args, **kwargs)
+        _emit("ERROR", msg, args)
 
-        for i, block in enumerate(groups_slice, 1):
-            log.info("Обрабатывается группа %d из %d", i, len(groups_slice))
+    # Подменяем методы на время выполнения
+    log.info = _info
+    log.warning = _warning
+    log.error = _error
+    log.exception = _exception
 
-            keywords = extract_keywords(block)
-            if not keywords:
-                log.warning("Группа %d не содержит ключей — пропущена", i)
-                continue
+    try:
 
-            main_query = keywords[0][0]
-            phrases_block = "\n".join(f"{k} частотность {f}" for k, f in keywords)
+        client = get_anthropic_client()
 
-            # 1) ТЗ => Claude
-            tz_prompt = TZ_USER_PROMPT_TEMPLATE.format(
-                main_query=main_query, phrases_block=phrases_block
-            )
-            tz_text, tz_in_tokens, tz_out_tokens = claude_complete(
-                client, SYSTEM_PROMPT_TZ, tz_prompt,
-                max_tokens=MAX_TOKENS_TZ, temperature=TEMPERATURE
-            )
+        # Пути на хосте
+        input_csv = input_csv if input_csv.is_absolute() else (BASE_DIR / input_csv)
+        if not input_csv.exists():
+            raise FileNotFoundError(f"Входной CSV не найден: {input_csv}")
 
-            # 2) Статья => Claude
-            article_id = f"ID{i:05d}"
-            art_prompt = ARTICLE_USER_PROMPT_TEMPLATE.format(
-                article_id=article_id, tz_text=tz_text
-            )
-            html_text, art_in_tokens, art_out_tokens = claude_complete(
-                client, SYSTEM_PROMPT_ARTICLE, art_prompt,
-                max_tokens=MAX_TOKENS_ARTICLE, temperature=TEMPERATURE
-            )
+        out_csv = BASE_DIR / "articles.csv"
 
-            # снять возможные ```html
-            fence = re.compile(r"^```\s*html\s*$|^```$", re.I)
-            html_text = "\n".join(
-                line for line in html_text.splitlines() if not fence.match(line)
-            ).strip()
+        groups = parse_groups(input_csv)
+        log.info("Загружено групп: %d", len(groups))
+        groups_slice = groups[groups_start:] if groups_end is None else groups[groups_start:groups_end]
+        log.info("Будет обработано групп: %d (с %d по %d)", len(groups_slice), groups_start + 1, (groups_end or len(groups)))
+        log.info("🚀 Старт обработки...")
 
-            # Метаданные/заголовок
-            h1 = re.search(r"<h1[^>]*>(.*?)</h1>", html_text, flags=re.I | re.S)
-            title = html.unescape(h1.group(1).strip()) if h1 else main_query.title()
-            slug = slugify(title)
+        with out_csv.open("w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=["title", "slug", "tz", "html"])
+            writer.writeheader()
 
-            # Запись в общий CSV
-            writer.writerow({"title": title, "slug": slug, "tz": tz_text, "html": html_text})
-            log.info("✅ Сохранено в CSV: %s", slug)
+            total_cost = 0.0
+            saved_html_files: list[str] = []
 
-            # (Опционально) сохранить отдельный html на хосте
-            if save_html:
-                out_dir = BASE_DIR / "output"
-                out_dir.mkdir(exist_ok=True)
-                out_file = out_dir / f"{slug}.html"
-                out_file.write_text(html_text, encoding="utf-8")
-                saved_html_files.append(str(out_file))
-                log.info("💾 HTML-файл сохранён на хосте: %s", out_file)
+            for i, block in enumerate(groups_slice, 1):
+                log.info("Обрабатывается группа %d из %d", i, len(groups_slice))
 
-            # Стоимость (Anthropic)
-            tz_cost  = anthropic_cost_usd(tz_in_tokens, tz_out_tokens)
-            art_cost = anthropic_cost_usd(art_in_tokens, art_out_tokens)
-            art_total_cost = tz_cost + art_cost
-            total_cost += art_total_cost
+                keywords = extract_keywords(block)
+                if not keywords:
+                    log.warning("Группа %d не содержит ключей — пропущена", i)
+                    continue
 
-            log.info(
-                "🔸 Токены ТЗ (in/out): %s/%s | Статья (in/out): %s/%s | Стоимость: $%.4f (сумма: $%.4f)",
-                tz_in_tokens, tz_out_tokens, art_in_tokens, art_out_tokens, art_total_cost, total_cost
-            )
+                main_query = keywords[0][0]
+                phrases_block = "\n".join(f"{k} частотность {f}" for k, f in keywords)
 
-    log.info("Готово → файл %s", out_csv)
-    log.info("ИТОГОВАЯ сумма: $%.4f", total_cost)
+                # 1) ТЗ => Claude
+                tz_prompt = TZ_USER_PROMPT_TEMPLATE.format(
+                    main_query=main_query, phrases_block=phrases_block
+                )
+                tz_text, tz_in_tokens, tz_out_tokens = claude_complete(
+                    client, SYSTEM_PROMPT_TZ, tz_prompt,
+                    max_tokens=MAX_TOKENS_TZ, temperature=TEMPERATURE
+                )
 
-    return {
-        "articles_csv": str(out_csv),
-        "total_cost": round(total_cost, 4),
-        "groups_processed": len(groups_slice),
-        "saved_html_files": saved_html_files,
-    }
+                # 2) Статья => Claude
+                article_id = f"ID{i:05d}"
+                art_prompt = ARTICLE_USER_PROMPT_TEMPLATE.format(
+                    article_id=article_id, tz_text=tz_text
+                )
+                html_text, art_in_tokens, art_out_tokens = claude_complete(
+                    client, SYSTEM_PROMPT_ARTICLE, art_prompt,
+                    max_tokens=MAX_TOKENS_ARTICLE, temperature=TEMPERATURE
+                )
+
+                # снять возможные ```html
+                fence = re.compile(r"^```\s*html\s*$|^```$", re.I)
+                html_text = "\n".join(
+                    line for line in html_text.splitlines() if not fence.match(line)
+                ).strip()
+
+                # Метаданные/заголовок
+                h1 = re.search(r"<h1[^>]*>(.*?)</h1>", html_text, flags=re.I | re.S)
+                title = html.unescape(h1.group(1).strip()) if h1 else main_query.title()
+                slug = slugify(title)
+
+                # Запись в общий CSV
+                writer.writerow({"title": title, "slug": slug, "tz": tz_text, "html": html_text})
+                log.info("✅ Сохранено в CSV: %s", slug)
+
+                # (Опционально) сохранить отдельный html на хосте
+                if save_html:
+                    out_dir = BASE_DIR / "output"
+                    out_dir.mkdir(exist_ok=True)
+                    out_file = out_dir / f"{slug}.html"
+                    out_file.write_text(html_text, encoding="utf-8")
+                    saved_html_files.append(str(out_file))
+                    log.info("💾 HTML-файл сохранён на хосте: %s", out_file)
+
+                # Стоимость (Anthropic)
+                tz_cost  = anthropic_cost_usd(tz_in_tokens, tz_out_tokens)
+                art_cost = anthropic_cost_usd(art_in_tokens, art_out_tokens)
+                art_total_cost = tz_cost + art_cost
+                total_cost += art_total_cost
+
+                log.info(
+                    "🔸 Токены ТЗ (in/out): %s/%s | Статья (in/out): %s/%s | Стоимость: $%.4f (сумма: $%.4f)",
+                    tz_in_tokens, tz_out_tokens, art_in_tokens, art_out_tokens, art_total_cost, total_cost
+                )
+
+        log.info("Готово → файл %s", out_csv)
+        log.info("ИТОГОВАЯ сумма: $%.4f", total_cost)
+
+        return {
+            "articles_csv": str(out_csv),
+            "total_cost": round(total_cost, 4),
+            "groups_processed": len(groups_slice),
+            "saved_html_files": saved_html_files,
+        }
+    finally:
+        # Восстанавливаем оригинальные методы, чтобы не влиять на параллельные запросы
+        log.info = _orig_info
+        log.warning = _orig_warning
+        log.error = _orig_error
+        log.exception = _orig_exception
 
 # ─────────────────────────────── FASTAPI ────────────────────────────────
 class GenerateRequest(BaseModel):
@@ -401,27 +446,53 @@ async def articles_generator_upload(
         except: pass
         raise
 
-@app.post("/articles_generator_stream")
-def articles_generator_stream(req: GenerateRequest):
+@app.post("/articles_generator_stream_upload")
+async def articles_generator_stream_upload(
+    background: BackgroundTasks,
+    file: UploadFile = File(...),
+    groups_start: int = Form(0),
+    groups_end: int | None = Form(None),
+    save_html: bool = Form(False),
+    keep_server_copy: bool = Form(True),
+):
     """
-    SSE без прогрессбара: стримим ключевые события строками.
+    Загружаем CSV и сразу стримим клиенту процесс обработки (логи + результат).
     """
+    tmp_name = f"{uuid.uuid4()}_{file.filename}"
+    tmp_path = BASE_DIR / tmp_name
+    with tmp_path.open("wb") as f:
+        f.write(await file.read())
+
     q = Queue()
     DONE = object()
 
+    def emit(line: str):
+        q.put(f"data: {line}\n\n")
+
     def worker():
         try:
-            q.put("Начали обработку")
+            emit(f"INFO:     UPLOAD start: {file.filename}, groups_start={groups_start}, groups_end={groups_end}, save_html={save_html}, keep={keep_server_copy}")
             result = generate_articles(
-                input_csv=Path(req.input_csv),
-                groups_start=req.groups_start,
-                groups_end=req.groups_end,
-                save_html=req.save_html,
+                input_csv=tmp_path,
+                groups_start=groups_start,
+                groups_end=groups_end,
+                save_html=save_html,
+                client_emit=emit,         
             )
-            q.put(json.dumps({"_result": result}, ensure_ascii=False))
+            emit(json.dumps({
+            "_result": {
+                **result,
+                "download_url": f"/download_once?path={result['articles_csv']}"
+            }
+        }, ensure_ascii=False))
         except Exception as e:
-            q.put(json.dumps({"_error": str(e)}, ensure_ascii=False))
+            emit(json.dumps({"_error": str(e)}, ensure_ascii=False))
         finally:
+            if not keep_server_copy:
+                try: os.remove(result["articles_csv"])
+                except: pass
+            try: os.remove(tmp_path)
+            except: pass
             q.put(DONE)
 
     Thread(target=worker, daemon=True).start()
@@ -432,7 +503,37 @@ def articles_generator_stream(req: GenerateRequest):
             item = q.get()
             if item is DONE:
                 break
-            yield f"data: {item}\n\n"
+            yield item
         yield "event: end\ndata: done\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+
+@app.get("/download")
+def download(path: str = Query(..., description="Абсолютный путь к файлу в контейнере")):
+    p = Path(path).resolve()
+    base = BASE_DIR.resolve()
+    # безопасность: разрешаем скачивать только из BASE_DIR
+    if not (p.exists() and (p == base or base in p.parents)):
+        raise HTTPException(status_code=404, detail="Файл не найден")
+    return FileResponse(p, media_type="text/csv", filename=p.name)
+
+@app.get("/download_once")
+def download_once(path: str = Query(..., description="Абсолютный путь к файлу в контейнере")):
+    p = Path(path).resolve()
+    base = BASE_DIR.resolve()
+    # безопасность: разрешаем скачивать только из BASE_DIR
+    if not (p.exists() and (p == base or base in p.parents)):
+        raise HTTPException(status_code=404, detail="Файл не найден")
+
+    # отдаём файл и планируем его удалить после отдачи
+    background = BackgroundTasks()
+    background.add_task(os.remove, p)
+
+    return FileResponse(
+        p,
+        media_type="text/csv",
+        filename=p.name,
+        background=background
+    )
