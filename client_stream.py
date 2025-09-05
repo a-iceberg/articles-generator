@@ -7,7 +7,7 @@ GROUPS_START = 0 # с какой группы начать (индексация
 GROUPS_END = 1 # до какой группы (не включительно), None — до конца
 #❗❗❗эти параметры надо изменять (остальное не трогать!)--------------------❗❗❗
 
-#---------
+
 def parse_cli_params():
     parser = argparse.ArgumentParser(
         description="Клиент для stream-обработки статей (без правки кода)."
@@ -30,16 +30,13 @@ def parse_cli_params():
     )
     args = parser.parse_args()
 
-    # Преобразуем end: строка 'None' -> None, иначе int
+
     end_val = None if str(args.end).lower() == "none" else int(args.end)
 
     return args.input_file, args.start, end_val
 
-# Используем финальные параметры по всему скрипту:
+
 INPUT_FILE, GROUPS_START, GROUPS_END = parse_cli_params()
-#---------
-
-
 
 
 SAVE_HTML = False

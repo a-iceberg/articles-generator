@@ -23,6 +23,23 @@ from queue import Queue
 import uuid
 from fastapi import Query
 
+# логи
+import logging
+
+def _enable_timestamps_in_uvicorn_logs():
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
+    for name in ("uvicorn.error", "uvicorn.access"):
+        lg = logging.getLogger(name)
+        if lg.handlers:
+            for h in lg.handlers:
+                h.setFormatter(fmt)
+        else:
+            h = logging.StreamHandler()
+            h.setFormatter(fmt)
+            lg.addHandler(h)
+        lg.propagate = False
+
 # ─────────────────────────────── НАСТРОЙКИ ПУТЕЙ ───────────────────────────────
 # ВСЕ файлы читаем/пишем в хостовую папку (монтируемую как /work).
 BASE_DIR = Path(os.getenv("HOST_WORKDIR", "/work"))
@@ -238,10 +255,10 @@ def generate_articles(input_csv: Path, groups_start: int, groups_end: Optional[i
     _orig_exception = log.exception
 
     def _emit(prefix, msg, args):
-        # Формат как в контейнере: "INFO:     Текст..."
         if client_emit:
             try:
-                client_emit(f"{prefix}:     {msg % args}")
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                client_emit(f"{ts} {prefix}:     {msg % args}")
             except Exception:
                 pass
 
@@ -381,6 +398,10 @@ class GenerateRequest(BaseModel):
 
 app = FastAPI(title="Articles Generator API (Claude)")
 
+@app.on_event("startup")
+async def _setup_logging_format():
+    _enable_timestamps_in_uvicorn_logs()
+    
 @app.post("/articles_generator")
 def articles_generator(req: GenerateRequest):
     try:
@@ -514,7 +535,6 @@ async def articles_generator_stream_upload(
 def download(path: str = Query(..., description="Абсолютный путь к файлу в контейнере")):
     p = Path(path).resolve()
     base = BASE_DIR.resolve()
-    # безопасность: разрешаем скачивать только из BASE_DIR
     if not (p.exists() and (p == base or base in p.parents)):
         raise HTTPException(status_code=404, detail="Файл не найден")
     return FileResponse(p, media_type="text/csv", filename=p.name)
@@ -523,7 +543,6 @@ def download(path: str = Query(..., description="Абсолютный путь �
 def download_once(path: str = Query(..., description="Абсолютный путь к файлу в контейнере")):
     p = Path(path).resolve()
     base = BASE_DIR.resolve()
-    # безопасность: разрешаем скачивать только из BASE_DIR
     if not (p.exists() and (p == base or base in p.parents)):
         raise HTTPException(status_code=404, detail="Файл не найден")
 
