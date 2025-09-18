@@ -4,9 +4,18 @@ setlocal ENABLEEXTENSIONS ENABLEDELAYEDEXPANSION
 
 pushd "%~dp0"
 
-REM --- Python / venv ---
-where python >nul 2>&1 && (set "PY=python") || (where py >nul 2>&1 && (set "PY=py") || (echo [ОШИБКА] Не найден Python & goto :halt))
+rem === Поиск Python ===
+set "PY="
+where python >nul 2>&1 && set "PY=python"
+if not defined PY (
+  where py >nul 2>&1 && set "PY=py"
+)
+if not defined PY (
+  echo [ОШИБКА] Не найден Python 3.10+ в PATH
+  goto :halt
+)
 
+rem === Виртуальное окружение ===
 if not exist ".venv\Scripts\python.exe" (
   echo == Создаю venv...
   %PY% -m venv .venv || (echo [ОШИБКА] Не удалось создать .venv & goto :halt)
@@ -14,32 +23,31 @@ if not exist ".venv\Scripts\python.exe" (
 
 set "VENV_PY=.venv\Scripts\python.exe"
 echo == Проверяю зависимости...
-call "%VENV_PY%" -m pip install --upgrade pip requests >nul 2>&1
+"%VENV_PY%" -m pip install --upgrade pip >nul
+"%VENV_PY%" -m pip install requests >nul || (echo [ОШИБКА] Не удалось установить зависимости & goto :halt)
 
-REM --- CSV ---
-if exist "iceberg.csv" (
-  set "INPUT_FILE=iceberg.csv"
-  echo Найден файл iceberg.csv, он будет использован по умолчанию.
-  set /p INPUT_FILE=Введите путь к другому CSV или нажмите Enter для значения по умолчанию:
-  if "!INPUT_FILE!"=="" set "INPUT_FILE=iceberg.csv"
+rem === Выбор CSV ===
+set "DEFAULT=iceberg.csv"
+if exist "%DEFAULT%" (
+  echo Найден файл %DEFAULT%, он будет использован по умолчанию.
+  set /p INPUT_FILE=Введите путь к другому CSV или нажмите Enter для значения по умолчанию: 
+  if not defined INPUT_FILE set "INPUT_FILE=%DEFAULT%"
 ) else (
-  set /p INPUT_FILE=Укажите путь к CSV:
+  set /p INPUT_FILE=Укажите путь к CSV: 
 )
 
-REM --- диапазоны ---
+rem === Диапазон групп ===
 set /p START=С какой группы начать (0):
-if "!START!"=="" set "START=0"
-
+if "%START%"=="" set "START=0"
 set /p END=До какой группы (не включительно). Оставьте пустым, чтобы до конца:
+if "%END%"=="" set "END=None"
 
-REM --- запуск ---
 echo == Запуск client_stream.py ...
-if "!END!"=="" (
-  call "%VENV_PY%" client_stream.py --input-file "!INPUT_FILE!" --start !START!
+if /i "%END%"=="None" (
+  "%VENV_PY%" client_stream.py --input-file "%INPUT_FILE%" --start %START%
 ) else (
-  call "%VENV_PY%" client_stream.py --input-file "!INPUT_FILE!" --start !START! --end !END!
+  "%VENV_PY%" client_stream.py --input-file "%INPUT_FILE%" --start %START% --end %END%
 )
-
 
 echo.
 echo Готово. Нажмите клавишу для выхода...
